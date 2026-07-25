@@ -7,6 +7,7 @@ Aware is a React Native mobile application built for low and no vision individua
 - The app should be screen reader friendly and useable by those with full, low, or no vision. In some cases, full vision users may be individuals assisting the impaired person with setup. With that said, ALL functions should be able to be completed by someone with low or no vision independently.
 - The app should be super accessible and feature generous margins, text sizes, contrasts, etc., and we should respect OS-level settings like accessibility options like increased test size.
 - The app's technical function should prioritize low latency (reducing network roundtrips or streaming content wherever possible) as an alert given too late is completely worthless and actually worse in many circumstances (DO NOT over correct here, just let this be a guiding principle).
+- The app is safety-critical and should be built as regulated software from the first commit: business logic is pure and unit tested, and the [critical paths](#critical-paths--100-branch-coverage-enforced) carry 100% branch coverage as an enforced merge gate. A missed curb or platform-edge alert is a physical-injury failure mode, and this product could one day be classified as a medical device.
 
 ## Features
 
@@ -259,17 +260,67 @@ treating them as a budget.*
 
 ### Speech — ElevenLabs Flash v2.5 (`eleven_flash_v2_5`)
 
-~75 ms model inference, 32 languages. Driven over the **WebSocket streaming-input
-endpoint**, not the REST endpoint — text is fed in progressively as Gemini emits
-it, so synthesis starts on the first clause instead of waiting for the full alert.
+~75 ms model inference, 32 languages. Driven over the **multi-context WebSocket**,
+not the REST endpoint — text is fed in progressively as Gemini emits it, so synthesis
+starts on the first clause instead of waiting for the full alert:
+
+```
+wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/multi-stream-input
+  ?model_id=eleven_flash_v2_5
+  &auto_mode=true
+```
+
+**`auto_mode=true`** disables the chunk schedule and its buffers, so ElevenLabs
+generates as soon as a phrase terminates instead of stalling until enough characters
+have accumulated. With the scheduler on, a 125-character chunk schedule holding a
+50-character alert would sit there waiting for text that is never coming — *"Curb
+down two paces ahead"* is the entire utterance. That stall is the whole latency
+budget.
+
+The trade is that `auto_mode` expects **complete phrases, not partial words** — it
+has no buffer left to assemble them. That is exactly why the pipeline below chunks
+Gemini's output on clause boundaries before it reaches the socket rather than
+forwarding raw tokens; the two settings only work as a pair.
+
+**One socket per session, one context per utterance.** `multi-stream-input` carries
+multiple independent generations — each with its own `context_id` and its own state —
+over a single connection, so the socket is opened once when a session starts and
+every alert after that is an `InitialiseContext` rather than a fresh WebSocket and
+TLS handshake. Aware's speech is bursty and short: a single crossing can produce a
+curb, a signal, and a traffic alert within a few seconds. Paying a handshake per
+utterance would put connection setup on the hot path repeatedly, and it is the one
+cost in the [budget above](#streaming-strategy) that buys nothing.
+
+Contexts also give us the cancel semantics the product already promises:
+
+- **Overlapping alerts** — a new alert opens its own context and plays immediately
+  while `CloseContextClient` drops the one it supersedes. No socket teardown, and no
+  waiting for the previous utterance to drain. An *[urgent]* alert speaks on-device
+  (below) and doesn't need the socket at all, but it still closes whatever cloud
+  context is mid-utterance so the two don't talk over each other.
+- **Swipe-bar tap to silence** ([controls](#swipe-bar--volume--speech)) — close the
+  active context and stop playback; the connection stays warm for whatever comes next.
+- **Reading vs. alerts** — a long [Reading](#left-button--reading) readout holds one
+  long-lived context while alerts come and go on their own, instead of the two
+  fighting over one serialized stream.
+- **Quiet stretches** — `KeepContextAlive` resets the inactivity timeout so an idle
+  walk doesn't cost a reconnect on the next alert.
+
+Two constraints worth recording. Voice is in the **path**, not the context, so all
+contexts on a connection share one voice — a per-profile voice change means a new
+socket, not a new context. And this does nothing for the *first* utterance of a
+session; that one still pays the handshake, so the socket should be opened when the
+glasses connect, not when the first alert fires.
 
 ### Streaming strategy
 
 Frame → Gemini → ElevenLabs → speaker, with every hop streaming:
 
-1. Glasses push frames (or a short clip) to the analysis call already in flight.
-2. Gemini's tokens are forwarded to the ElevenLabs WebSocket as they arrive, chunked
-   on clause boundaries so prosody stays natural.
+1. Glasses stream to the phone continuously; the phone forwards a short rolling clip
+   to the analysis call already in flight.
+2. Gemini's output is accumulated to the next clause boundary and flushed to the
+   ElevenLabs socket — whole phrases, as required by `auto_mode`, so prosody stays
+   natural.
 3. Audio chunks play as they return; playback begins before synthesis finishes.
 
 Rough time-to-first-audio budget:
@@ -285,6 +336,53 @@ Rough time-to-first-audio budget:
 Waiting for the complete text before calling TTS costs ~1.1 s instead — the
 streaming handoff is worth roughly 400 ms, which is the difference between a curb
 warning that lands and one that doesn't.
+
+#### Capture — a low-framerate stream, not a photo every second
+
+Continuous video is the single largest draw on the glasses' 260 mAh battery, so the
+obvious alternative is to poll `requestPhoto()` about once a second and skip video
+entirely. We stream anyway, at a low framerate, for three reasons:
+
+- **1 fps stills can't answer what the alerts ask.** A large share of the catalog is
+  about *motion*, not scene contents — is that car slowing or not, which way is the
+  escalator running, is the crossing signal counting down, is the bus pulling in or
+  pulling out. None of that survives independent frames a second apart, and it is
+  exactly why the [model choice](#environment-analysis--googlegemini-25-flash-lite)
+  leans on native video input.
+- **The photo path is a round-trip, and the budget can't absorb it.**
+  `requestPhoto()` captures, JPEG-encodes, and uploads to a webhook, so every frame
+  pays a full-resolution readout plus a fresh multipart upload — serialized, before
+  analysis starts, on top of the ~700–750 ms above, with jitter we don't control. A
+  stream keeps one connection open and lets frames reach a call already in flight.
+- **The battery saving is smaller than it looks.** Camera draw is dominated by
+  keeping the sensor and ISP awake, which polling doesn't avoid, and inter-frame
+  compression means a few fps of H.264 is *fewer* bytes than one full-resolution JPEG
+  per second. The camera light is always on for both capture modes, so polling only
+  trades a steady LED for a blinking one.
+
+The battery is won by duty-cycling the stream, not by avoiding it:
+
+| Context | Framerate |
+| --- | --- |
+| Stationary (no motion from the phone's accelerometer) | stream stopped |
+| Walking — default | 3–5 fps |
+| Street crossing, transit platform edge | burst to 10–15 fps |
+
+**Capture rate and inference rate are decoupled.** The glasses stream at 3–5 fps;
+Gemini runs at roughly 1–2 Hz over a rolling ~2 s clip, with near-identical frames
+dropped by frame-differencing on the phone before anything is sent. Model spend stays
+bounded no matter how fast the camera is running.
+
+**`requestPhoto()` still earns its place** — for [Reading](#left-button--reading) and
+face enrolment, where the capture is user-initiated, one-shot, and wants the full
+3264 × 2448 for small text rather than a compressed video frame. Pass `sound: false`.
+
+*Open question — outdoor transport.* Video needs Wi-Fi bandwidth, and outdoors the
+glasses are not on a network. The SDK's `sendWifiCredentials()` and
+`setHotspotState()` point at the intended path: the glasses join the phone's hotspot
+and stream to a local WHIP endpoint on the phone, which frame-diffs before spending
+tokens. The framerates above and the real drain curve need measuring on hardware
+before they're treated as a budget.
 
 **Urgent alerts use on-device TTS.** `AVSpeechSynthesizer` on iOS and
 `TextToSpeech` on Android are zero network and zero cost. Outdoors — walking to a
@@ -310,7 +408,7 @@ API share types and tooling and build/deploy together.
 ```
 aware/
 ├── apps/
-│   ├── mobile   # React Native app (the product)
+│   ├── mobile   # React Native (Expo) app (the product)
 │   ├── web      # Next.js marketing site
 │   └── api      # Express.js backend (orchestrates LLM as well)
 └── packages/
@@ -327,14 +425,56 @@ against the same `packages/core` contracts.
 
 ### Applications
 
-- **`apps/mobile` — React Native.** The product. Pairs with the [Mentra Live](#hardware)
-  glasses over Bluetooth via the MentraOS SDK, streams the camera/mic feed, plays
-  alerts (see the on-device TTS strategy above), and hosts all configuration
-  (profiles, per-alert tuning, trusted places, settings). History is stored locally.
+- **`apps/mobile` — React Native (Expo).** The product. Pairs with the
+  [Mentra Live](#hardware) glasses over Bluetooth via
+  [`@mentra/bluetooth-sdk`](https://www.npmjs.com/package/@mentra/bluetooth-sdk)
+  (see [below](#glasses-connectivity--mentrabluetooth-sdk)), streams the camera/mic
+  feed, plays alerts (see the on-device TTS strategy above), and hosts all
+  configuration (profiles, per-alert tuning, trusted places, settings). History is
+  stored locally.
 - **`apps/web` — Next.js.** Marketing site and account/subscription management.
   Served through Cloudflare's CDN.
 - **`apps/api` — Express.js.** Auth, settings/profile sync, subscription/billing,
   trusted-place and face-recognition services, and the LLM orchestration layer.
+
+### Glasses connectivity — `@mentra/bluetooth-sdk`
+
+The phone talks to the glasses through
+**[`@mentra/bluetooth-sdk`](https://www.npmjs.com/package/@mentra/bluetooth-sdk)**,
+Mentra's React Native / Expo SDK for connecting directly to Mentra smart glasses
+over Bluetooth. It ships an Expo config plugin plus native Android (`com.mentra:bluetooth-sdk`)
+and iOS (`MentraBluetoothSDK`) code, and exposes both an imperative `BluetoothSdk`
+object and React hooks under `@mentra/bluetooth-sdk/react`.
+
+It carries the whole device relationship, which is why we don't hand-roll BLE:
+
+- **Pairing** — `scan(DeviceModels.MentraLive, …)` backs the onboarding picker; the
+  chosen `Device` is persisted and restored with `setDefaultDevice()` /
+  `connectDefault()` so the glasses reconnect silently on later launches.
+- **Connection state** — `useMentraBluetooth()` exposes `glasses.connection` as a
+  discriminated union (`disconnected` / `scanning` / `connecting` / `bonding` /
+  `connected` + `fullyBooted`), which drives the spoken connection status and
+  reconnect prompts, plus battery and Wi-Fi state.
+- **Controls** — `useBluetoothEvent('button_press' | 'touch_event', …)` delivers the
+  two buttons and the swipe bar that power [Glasses Controls](#glasses-controls).
+- **Camera** — `startStream({video: {fps}})` / `keepStreamAlive()` (keep-alives ~every
+  15s) feeds the realtime alert path, at the duty-cycled framerates set out in
+  [Capture](#capture--a-low-framerate-stream-not-a-photo-every-second);
+  `requestPhoto()` handles full-resolution one-shots for
+  [Reading](#left-button--reading) and face enrolment.
+- **Microphone** — `setMicState(true)` plus the `mic_pcm` event gives us raw PCM for
+  push-to-talk. We call `setVoiceActivityDetectionEnabled(false)` so glasses-side VAD
+  doesn't clip audio destined for our own STT, and `setOwnAppAudioPlaying()` keeps
+  playback and capture from fighting.
+
+**Expo, but not Expo Go.** The SDK contains native code, so Expo Go can't load it —
+`apps/mobile` runs on Expo development builds (`expo prebuild` → `expo run:ios` /
+`expo run:android`) and ships as a standard production native build. That also sets
+our floors: Expo 49+, React Native 0.72+, Android minSdk 28, iOS 15.1+ — consistent
+with the [hardware](#hardware) compatibility above. The config plugin wires in the
+Bluetooth, microphone, and location permissions surfaced during
+[onboarding](#setup--account) (Android 12+ needs location permission and Location
+services on before BLE scan callbacks arrive).
 
 ### Backend & LLM
 
@@ -389,6 +529,108 @@ keeps the data model honest.
 
 - **Railway** — hosting for `api` and `web`, plus managed PostgreSQL and Redis.
 - **Cloudflare** — DNS for all domains, and CDN/proxy in front of the marketing site.
+
+## Testing & Safety
+
+Aware tells a blind user whether it is safe to take the next step. A wrong or
+missing alert at a curb, a platform edge, or a crossing is a physical-injury failure
+mode, not a bug report. Treat the codebase accordingly.
+
+**This will plausibly be regulated software.** A product that assists mobility and
+warns of hazards sits close to the line for **software as a medical device** —
+FDA's device software framework in the US, **EU MDR** Rule 11 in Europe — and the
+standards we would then be measured against are **IEC 62304** (medical device
+software lifecycle, safety classes A/B/C) and **ISO 14971** (risk management). Under
+62304, software whose failure can contribute to serious injury is Class C, which is
+where the mobility alert path lands.
+
+We are not claiming any classification or certification today. The point is narrower
+and entirely practical: the engineering practices those standards require —
+traceability from requirement to test, documented risk controls, evidence that the
+safety-relevant code is exercised — are extremely expensive to retrofit onto a
+codebase and nearly free to adopt from the first commit. Build as though the
+classification is coming.
+
+### Critical paths — 100% branch coverage, enforced
+
+The following modules are **critical paths**. They carry 100% coverage as a merge
+gate, and CI fails the build below it — not a warning, not a dashboard:
+
+| Critical path | Why |
+| --- | --- |
+| Alert decision & gating | Decides whether a hazard is spoken at all |
+| Distance, unit & step conversion | A feet/meters or off-by-one error is a physical hazard |
+| Urgency ranking & interrupt | Determines what a user hears when alerts collide |
+| Per-alert tuning & profile resolution | Wrong resolution silently disables a hazard alert |
+| Fallback & degradation logic | Network loss, socket death, glasses disconnect |
+| Trusted places / geofencing | Suppresses alerts by location — a suppression bug hides hazards |
+| History retention & deletion | The 30-day auto-delete is a stated privacy guarantee |
+
+**Branch coverage, not statement coverage.** Statement coverage is close to
+meaningless on this kind of logic: a threshold comparison, an urgency tie-break, or
+a profile-precedence rule executes its line under every input while taking only one
+of its branches. The number that means something here is whether both sides of every
+decision have been exercised.
+
+**Coverage is a floor, not the goal.** 100% branch coverage proves no branch is
+*unexercised*; it proves nothing about whether the branch is *correct*. It is the
+cheap, automatable half of the job. The other half is deliberate case design —
+boundary values at every configured trigger distance, unit-conversion round trips,
+collision cases where two alerts fire in the same frame, and every degradation path
+enumerated as a test rather than discovered in the field.
+
+**Failure paths get tested first, not last.** The alerts that matter most are the
+ones that fire when something is already going wrong: the ElevenLabs socket is dead,
+the network dropped mid-crossing, the glasses disconnected, the stream stalled. Those
+paths are the least exercised in day-to-day development and the most consequential in
+use. Every fallback described in this document — on-device TTS, pre-synthesized
+audio, stream restart — needs a test that forces the failure, not a test that assumes
+the happy path and hopes.
+
+### Business logic is unit tested, and kept unit testable
+
+Everything that decides *what the user is told* lives in pure, dependency-free
+functions in `packages/core` — inputs in, alert decision out, no I/O, no clock, no
+network. That is partly a testing convenience and mostly an architectural
+requirement: logic entangled with a Bluetooth socket or a live model call cannot be
+exhaustively tested, and untestable safety logic is the thing we are specifically
+trying not to build.
+
+The shared alert and profile schemas in `packages/core` are what make this
+enforceable in one place — the mobile app, the API, and the prompt builders resolve
+alerts through the same tested functions rather than each reimplementing the rules.
+
+### The model is evaluated, not unit tested
+
+Coverage does not apply to `gemini-2.5-flash-lite`, and pretending otherwise is the
+easiest way to get false confidence. Model behavior is non-deterministic and changes
+under us when a provider updates a route. It needs a different instrument:
+
+- **A held-out evaluation set** of real scenes per alert category, with expected
+  outcomes, scored on every prompt change and every model or routing change.
+- **False negatives weighted above false positives** on the hazard categories. A
+  missed stair is not symmetric with a spurious one, and a single aggregate accuracy
+  number hides exactly that distinction.
+- **Recorded results per version.** Which model, which routing, which prompt, which
+  scores — this is the evidence trail a regulator would ask for, and it is also just
+  how you find out a provider silently degraded your alert quality.
+
+What *is* unit tested around the model is everything deterministic that surrounds it:
+prompt construction, response parsing and schema validation, and the gating that
+decides whether a model-produced alert is spoken given the user's profile.
+
+### Traceability
+
+Every alert in the [Realtime Alerts](#realtime-alerts) catalog maps to named tests
+covering its trigger threshold, its suppression rules, and its urgency behavior. The
+catalog is the requirement list; the mapping from each entry to its tests is the
+artifact a 62304 audit asks for, and keeping it current from the start costs a line
+per alert. Reconstructing it later means re-deriving intent from code.
+
+Custom alerts inherit this through their feasibility check — the evaluation that
+tells a user whether Aware can reliably detect what they described is itself a
+safety-relevant decision, since its answer sets what someone believes their glasses
+will warn them about.
 
 ## Design
 
